@@ -38,6 +38,7 @@
 #define ALPS_FW_BK_2	0x40
 #define ALPS_PS2_INTERLEAVED	0x80	/* 3-byte PS/2 packet interleaved with
 					   6-byte ALPS packet */
+#define ALPS_EC_PROTO		0x100	/* "0xEC" memory access protocol */
 
 static const struct alps_model_info alps_model_data[] = {
 	{ { 0x32, 0x02, 0x14 },	0xf8, 0xf8, ALPS_PASS | ALPS_DUALPOINT }, /* Toshiba Salellite Pro M10 */
@@ -64,6 +65,7 @@ static const struct alps_model_info alps_model_data[] = {
 	{ { 0x73, 0x02, 0x50 }, 0xcf, 0xcf, ALPS_FW_BK_1 },		  /* Dell Vostro 1400 */
 	{ { 0x52, 0x01, 0x14 }, 0xff, 0xff,
 		ALPS_PASS | ALPS_DUALPOINT | ALPS_PS2_INTERLEAVED },	  /* Toshiba Tecra A11-11L */
+	{ { 0x73, 0x02, 0x64 }, 0x00, 0x00, ALPS_EC_PROTO },		  /* Dell E2 series multitouch */
 };
 
 /*
@@ -379,6 +381,12 @@ static psmouse_ret_t alps_process_byte(struct psmouse *psmouse)
 	struct alps_data *priv = psmouse->private;
 	const struct alps_model_info *model = priv->i;
 
+	if (model->flags & ALPS_EC_PROTO) {
+		psmouse->type = PSMOUSE_IMPS;
+		psmouse->protocol_handler = priv->old_protocol_handler;
+		return psmouse->protocol_handler(psmouse);
+	}
+
 	if ((psmouse->packet[0] & 0xc8) == 0x08) { /* PS/2 packet */
 		if (psmouse->pktcnt == 3) {
 			alps_report_bare_ps2_packet(psmouse, psmouse->packet,
@@ -417,12 +425,96 @@ static psmouse_ret_t alps_process_byte(struct psmouse *psmouse)
 	return PSMOUSE_GOOD_DATA;
 }
 
+static int alps_ec_mode(struct psmouse *psmouse, bool enable, unsigned char *ec_signature)
+{
+	struct ps2dev *ps2dev = &psmouse->ps2dev;
+	unsigned char param[3];
+
+	if (ps2_command(ps2dev, NULL, PSMOUSE_CMD_SETSTREAM))
+		return -1;
+	if (enable) {
+		/* EC EC EC E9 */
+		if (ps2_command(ps2dev, NULL, PSMOUSE_CMD_RESET_WRAP) ||
+		    ps2_command(ps2dev, NULL, PSMOUSE_CMD_RESET_WRAP) ||
+		    ps2_command(ps2dev, NULL, PSMOUSE_CMD_RESET_WRAP))
+			return -1;
+
+		param[0] = param[1] = param[2] = 0xff;
+		if (ps2_command(ps2dev, param, PSMOUSE_CMD_GETINFO))
+			return -1;
+
+		if (ec_signature) {
+			memcpy(ec_signature, param, sizeof(param));
+		}
+	}
+
+	return 0;
+}
+
+static int alps_ec_nibble(struct psmouse *psmouse, uint8_t nibble)
+{
+	struct ps2dev *ps2dev = &psmouse->ps2dev;
+	unsigned char param;
+	static const int cmds[] = {
+		PSMOUSE_CMD_SETPOLL,
+		PSMOUSE_CMD_RESET_DIS,
+		PSMOUSE_CMD_SETSCALE21,
+		PSMOUSE_CMD_SETRATE,
+		PSMOUSE_CMD_SETRATE,
+		PSMOUSE_CMD_SETRATE,
+		PSMOUSE_CMD_SETRATE,
+		PSMOUSE_CMD_SETRATE,
+		PSMOUSE_CMD_SETRATE,
+		PSMOUSE_CMD_SETRATE,
+		PSMOUSE_CMD_GETINFO,
+		PSMOUSE_CMD_SETRES,
+		PSMOUSE_CMD_SETRES,
+		PSMOUSE_CMD_SETRES,
+		PSMOUSE_CMD_SETRES,
+		PSMOUSE_CMD_SETSCALE11 };
+	static const unsigned char params[] = {
+		0xff, 0xff, 0xff, 10, 20, 40, 60, 80, 100, 200, 0xff, 0, 1, 2, 3, 0xff };
+
+	nibble &= 0xf;
+	param = params[nibble];
+	if (ps2_command(ps2dev, &param, cmds[nibble]))
+		return -1;
+
+	return 0;
+}
+
+static int alps_ec_write(struct psmouse *psmouse, uint16_t addr, uint8_t value)
+{
+	struct ps2dev *ps2dev = &psmouse->ps2dev;
+
+	/* Select new address: EC addr3 addr2 addr1 addr0 */
+	if (ps2_command(ps2dev, NULL, PSMOUSE_CMD_RESET_WRAP) ||
+	    alps_ec_nibble(psmouse, addr >> 12) ||
+	    alps_ec_nibble(psmouse, addr >> 8) ||
+	    alps_ec_nibble(psmouse, addr >> 4) ||
+	    alps_ec_nibble(psmouse, addr))
+		return -1;
+
+	/*
+	 * PSMOUSE_CMD_GETINFO can be used to read from the current address,
+	 * returning { addr_high, addr_low, value }  Useful when working with bit fields.
+	 */
+
+	/* Write byte: value1 value0 */
+	if (alps_ec_nibble(psmouse, value >> 4) ||
+	    alps_ec_nibble(psmouse, value))
+		return -1;
+
+	return 0;
+}
+
 static const struct alps_model_info *alps_get_model(struct psmouse *psmouse, int *version)
 {
 	struct ps2dev *ps2dev = &psmouse->ps2dev;
 	static const unsigned char rates[] = { 0, 10, 20, 40, 60, 80, 100, 200 };
 	unsigned char param[4];
 	int i;
+	static const struct alps_model_info *model = NULL;
 
 	/*
 	 * First try "E6 report".
@@ -469,10 +561,26 @@ static const struct alps_model_info *alps_get_model(struct psmouse *psmouse, int
 
 	for (i = 0; i < ARRAY_SIZE(alps_model_data); i++)
 		if (!memcmp(param, alps_model_data[i].signature,
-			    sizeof(alps_model_data[i].signature)))
-			return alps_model_data + i;
+			    sizeof(alps_model_data[i].signature))) {
+			model = alps_model_data + i;
+			break;
+		}
 
-	return NULL;
+	if (model && (model->flags & ALPS_EC_PROTO)) {
+		/*
+		 * For models with the 0xEC memory access protocol, verify that it activates successfully.
+		 * Should return 0x88,0x07,0x9b or 0x88,0x07,0x9d
+		 */
+		if (alps_ec_mode(psmouse, true, param))
+			return NULL;
+		dbg("EC report: %2.2x %2.2x %2.2x", param[0], param[1], param[2]);
+		if (param[0] != 0x88 || param[1] != 0x07 || (param[2] != 0x9b && param[2] != 0x9d))
+			return NULL;
+		if (alps_ec_mode(psmouse, false, NULL))
+			return NULL;
+	}
+
+	return model;
 }
 
 /*
@@ -652,11 +760,56 @@ static void alps_disconnect(struct psmouse *psmouse)
 	kfree(priv);
 }
 
+static int alps_imps_init(struct psmouse *psmouse)
+{
+	/*
+	 * Interesting bits at address 0005:
+	 *   01: IMPS emulation
+	 *   02: Disable hardware tapping entirely
+	 *   04: Disable corner tap for right-click
+	 *   80: Upper-left corner tap (rather than upper-right)
+	 */
+	if (alps_ec_mode(psmouse, true, NULL) ||
+	    alps_ec_write(psmouse, 0x0005, 0x01) ||
+	    alps_ec_mode(psmouse, false, NULL)) {
+		printk(KERN_WARNING "alps.c: Failed to initialize IMPS emulation mode\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int alps_imps_reconnect(struct psmouse *psmouse)
+{
+	const struct alps_model_info *model;
+
+	psmouse_reset(psmouse);
+
+	model = alps_get_model(psmouse, NULL);
+	if (!model || !(model->flags & ALPS_EC_PROTO))
+		return -1;
+
+	return alps_imps_init(psmouse);
+}
+
+static void alps_imps_disconnect(struct psmouse *psmouse)
+{
+	if (alps_ec_mode(psmouse, true, NULL) ||
+	    alps_ec_write(psmouse, 0x0003, 0x01) ||
+	    alps_ec_mode(psmouse, false, NULL)) {
+		printk(KERN_WARNING "alps.c: Failed to reset EC memory\n");
+	}
+
+	psmouse_reset(psmouse);
+	kfree(psmouse->private);
+}
+
 int alps_init(struct psmouse *psmouse)
 {
 	struct alps_data *priv;
 	struct input_dev *dev1 = psmouse->dev, *dev2;
 	int version;
+	const struct alps_model_info *model;
 
 	priv = kzalloc(sizeof(struct alps_data), GFP_KERNEL);
 	dev2 = input_allocate_device();
@@ -667,6 +820,26 @@ int alps_init(struct psmouse *psmouse)
 	setup_timer(&priv->timer, alps_flush_packet, (unsigned long)psmouse);
 
 	psmouse->private = priv;
+
+	model = alps_get_model(psmouse, &version);
+	if (!model)
+		goto init_fail;
+	if (model->flags & ALPS_EC_PROTO) {
+		priv->i = model;
+		printk(KERN_INFO "alps.c: ALPS_EC_PROTO detected\n");
+		if (alps_imps_init(psmouse))
+			return -1;
+		input_free_device(priv->dev2);
+		priv->old_protocol_handler = psmouse->protocol_handler;
+		psmouse->disconnect = alps_imps_disconnect;
+		psmouse->reconnect = alps_imps_reconnect;
+		psmouse->protocol_handler = alps_process_byte;
+		__set_bit(BTN_MIDDLE, psmouse->dev->keybit);
+		__set_bit(REL_WHEEL, psmouse->dev->relbit);
+		psmouse->pktsize = 4;
+		return 0;
+	}
+
 
 	if (alps_hw_init(psmouse, &version))
 		goto init_fail;

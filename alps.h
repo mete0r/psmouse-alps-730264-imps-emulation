@@ -15,7 +15,7 @@
 struct alps_model_info {
         unsigned char signature[3];
         unsigned char byte0, mask0;
-        unsigned char flags;
+        unsigned int flags;
 };
 
 struct alps_data {
@@ -24,6 +24,7 @@ struct alps_data {
 	const struct alps_model_info *i;/* Info */
 	int prev_fin;			/* Finger bit from previous packet */
 	struct timer_list timer;
+	psmouse_ret_t (*old_protocol_handler)(struct psmouse *psmouse);
 };
 
 #ifdef CONFIG_MOUSE_PS2_ALPS
